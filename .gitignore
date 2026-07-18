@@ -1,0 +1,40 @@
+# Secrets — NEVER commit
+.env
+.env.*
+*.key
+*.pem
+credentials.json
+secrets/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.pytest_cache/
+
+# Models (large files)
+*.gguf
+models/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Backend closed-source (we only open the node client)
+router/
+apigateway/
+credits/
+config/
+
+# Logs
+*.log
+logs/
