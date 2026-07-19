@@ -10,7 +10,8 @@ from urllib.request import Request, urlopen
 from urllib.error import URLError
 
 # ============ 配置 ============
-ROUTER_URL = os.getenv("MESHMOE_ROUTER_URL", "http://127.0.0.1:4001")
+# 公网节点入口(nginx → router):注册/轮询/结果/chunk 全走这里,无需公网 IP
+ROUTER_URL = os.getenv("MESHMOE_ROUTER_URL", "https://meshmoe.com/node")
 MODEL_DIR = os.getenv("MESHMOE_MODEL_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "models"))
 PORT = int(os.getenv("MESHMOE_PORT", "4002"))
 NODE_ID = os.getenv("MESHMOE_NODE_ID", socket.gethostname())
@@ -35,14 +36,14 @@ if MOCK_MODE:
 # source: modelscope优先, huggingface备用
 MODEL_CATALOG = {
     # --- Light: CPU / 核显, 2-4GB RAM ---
-    "Qwen3-0.6B-Q4_K_M": {
-        "gguf_file": "Qwen3-0.6B-Q4_K_M.gguf",
-        "size_mb": 462,
+    "Qwen3-0.6B-Q8_0": {
+        "gguf_file": "Qwen3-0.6B-Q8_0.gguf",
+        "size_mb": 800,
         "min_ram_gb": 2,
         "gpu_vram_mb": 0,
         "tier": "light",
         "expert_type": "general",
-        "description": "Qwen3 0.6B - 最小最快, CPU可跑",
+        "description": "Qwen3 0.6B - 最小最快, CPU可跑(官方 Q8_0)",
         "modelscope_org": "Qwen",
         "modelscope_repo": "Qwen3-0.6B-GGUF",
         "huggingface_repo": "Qwen/Qwen3-0.6B-GGUF",
@@ -274,6 +275,59 @@ class EdgeNode:
         print(f"[EdgeNode] Model loaded! Ready to process tasks.")
         return True
 
+    def infer_stream(self, messages, max_tokens=512):
+        """E2-1 流式推理:生成器,yield (delta_text),最后一个 yield 后是 usage。
+        用 create_chat_completion(官方 chat template,比手拼 prompt 诚实)。"""
+        if MOCK_MODE:
+            last_user = ""
+            for msg in reversed(messages):
+                if msg.get("role") == "user":
+                    last_user = msg.get("content", "")
+                    break
+            mock_text = f"[MOCK:{self.model_name}] Echo: {last_user[:80]} | replied at {time.strftime('%H:%M:%S')}"
+            # 按词切片模拟流式
+            words = mock_text.split(" ")
+            for i, w in enumerate(words):
+                yield ("delta", w + (" " if i < len(words) - 1 else ""))
+                time.sleep(0.05)
+            pt = len(last_user) // 4
+            ct = min(max_tokens, max(8, len(mock_text) // 4))
+            yield ("usage", {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct})
+            return
+
+        if not self.model_loaded:
+            yield ("error", "model not loaded")
+            return
+        try:
+            # llama.cpp 流式:每个含 content 的 part ≈ 1 token,直接计数(最诚实的 usage)
+            n_completion = 0
+            stream = self.llm.create_chat_completion(
+                messages=messages, max_tokens=max_tokens, temperature=0.7, stream=True)
+            for part in stream:
+                delta = part.get("choices", [{}])[0].get("delta", {})
+                content = delta.get("content") or ""
+                if content:
+                    n_completion += 1
+                    yield ("delta", content)
+                u = part.get("usage")
+                if u:
+                    yield ("usage", u)
+            # 估算 prompt tokens(拼接消息过一遍 tokenizer,近似)
+            try:
+                concat = "\n".join(str(m.get("content", "")) for m in messages)
+                n_prompt = len(self.llm.tokenize(concat.encode("utf-8")))
+            except Exception:
+                n_prompt = max(1, sum(len(str(m.get("content", ""))) for m in messages) // 4)
+            yield ("usage", {
+                "prompt_tokens": n_prompt,
+                "completion_tokens": n_completion,
+                "total_tokens": n_prompt + n_completion,
+            })
+            self.tasks_processed += 1
+            self.tokens_earned += n_completion
+        except Exception as e:
+            yield ("error", str(e))
+
     def infer(self, messages, max_tokens=512):
         if MOCK_MODE:
             t0 = time.time()
@@ -299,23 +353,12 @@ class EdgeNode:
             return {"error": "model not loaded"}
 
         t0 = time.time()
-        # Build prompt from messages
-        prompt = ""
-        for msg in messages:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            if role == "system":
-                prompt += f"System: {content}\n"
-            elif role == "user":
-                prompt += f"User: {content}\n"
-            elif role == "assistant":
-                prompt += f"Assistant: {content}\n"
-        prompt += "Assistant: "
-
         try:
-            result = self.llm(prompt, max_tokens=max_tokens, temperature=0.7)
+            # create_chat_completion:走模型官方 chat template(比手拼 prompt 诚实准确)
+            result = self.llm.create_chat_completion(
+                messages=messages, max_tokens=max_tokens, temperature=0.7)
             elapsed = time.time() - t0
-            text = result["choices"][0]["text"] if result.get("choices") else ""
+            text = result["choices"][0]["message"]["content"] if result.get("choices") else ""
             tokens = result.get("usage", {}).get("completion_tokens", 0)
 
             self.tasks_processed += 1
@@ -333,8 +376,29 @@ class EdgeNode:
 
 
 # ============ Router通信 ============
+def submit_chunk(task_id, payload, latency_ms=0):
+    """E2-1 边缘流式:向 Router 推一个 chunk。
+    payload: {"delta": "..."} / {"finish": True, "usage": {...}} / {"error": "..."}"""
+    data = json.dumps({
+        "task_id": task_id,
+        "peer_id": NODE_ID,
+        "latency_ms": latency_ms,
+        **payload,
+    }).encode()
+    for url in [f"{ROUTER_URL}/task/chunk", f"{ROUTER_URL}/api/task/chunk"]:
+        try:
+            req = Request(url, data=data, headers={
+                "Content-Type": "application/json",
+                "User-Agent": f"MeshMoE-Edge/2.0 ({NODE_ID})"
+            }, method="POST")
+            with urlopen(req, timeout=10) as resp:
+                return json.loads(resp.read())
+        except:
+            continue
+    return None
+
 def register_with_router(hardware_info, model_name, expert_type, tier):
-    """向Router注册节点"""
+    """向Router注册节点。MOCK_MODE 时自我申报 mock=true(诚实标注,L2 探针豁免)"""
     cfg = MODEL_CATALOG.get(model_name, {})
     data = json.dumps({
         "peer_id": NODE_ID,
@@ -343,6 +407,7 @@ def register_with_router(hardware_info, model_name, expert_type, tier):
         "port": PORT,
         "tier": tier,
         "hardware": hardware_info,
+        "mock": MOCK_MODE,
     }).encode()
 
     url = f"{ROUTER_URL}/api/nodes"  # Nginx proxies /api/nodes to Router
@@ -465,20 +530,53 @@ def worker_loop():
         task_id = task.get("task_id", "")
         messages = task.get("messages", [])
         max_tokens = task.get("max_tokens", 512)
+        is_stream = bool(task.get("stream"))
 
-        print(f"[Worker] Task {task_id}: {messages[-1].get('content', '')[:60]}...")
+        print(f"[Worker] Task {task_id}{' (stream)' if is_stream else ''}: {messages[-1].get('content', '')[:60]}...")
 
-        result = edge.infer(messages, max_tokens)
-        latency = result.get("latency_ms", 0)
-        success = "error" not in result
-
-        # 提交结果
-        submit_result(task_id, result, latency, success)
-
-        if success:
-            print(f"[Worker] Task {task_id} done ({latency}ms, {result.get('usage',{}).get('completion_tokens',0)} tokens)")
+        if is_stream:
+            # E2-1 流式:边生成边推 chunk
+            t0 = time.time()
+            usage = {}
+            error = None
+            delta_buf = []
+            last_flush = time.time()
+            for kind, val in edge.infer_stream(messages, max_tokens):
+                if kind == "delta":
+                    delta_buf.append(val)
+                    # 200ms 批量推一次,减少 HTTP  chatter
+                    if time.time() - last_flush >= 0.2:
+                        submit_chunk(task_id, {"delta": "".join(delta_buf)})
+                        delta_buf = []
+                        last_flush = time.time()
+                elif kind == "usage":
+                    usage = val
+                elif kind == "error":
+                    error = val
+                    break
+            if delta_buf:
+                submit_chunk(task_id, {"delta": "".join(delta_buf)})
+            latency = round((time.time() - t0) * 1000)
+            if error:
+                submit_chunk(task_id, {"error": error}, latency)
+                print(f"[Worker] Stream task {task_id} failed: {error}")
+            else:
+                if not usage:
+                    usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+                submit_chunk(task_id, {"finish": True, "usage": usage}, latency)
+                print(f"[Worker] Stream task {task_id} done ({latency}ms)")
         else:
-            print(f"[Worker] Task {task_id} failed: {result.get('error', 'unknown')}")
+            result = edge.infer(messages, max_tokens)
+            latency = result.get("latency_ms", 0)
+            success = "error" not in result
+
+            # 提交结果
+            submit_result(task_id, result, latency, success)
+
+            if success:
+                print(f"[Worker] Task {task_id} done ({latency}ms, {result.get('usage',{}).get('completion_tokens',0)} tokens)")
+            else:
+                print(f"[Worker] Task {task_id} failed: {result.get('error', 'unknown')}")
 
         # 短暂休息避免过热
         time.sleep(1)
@@ -515,7 +613,7 @@ def main():
             print(f"\n[Model] Auto-selected: {chosen}")
             print(f"  {MODEL_CATALOG[chosen]['description']}")
         else:
-            chosen = "Qwen3-0.6B-Q4_K_M"
+            chosen = "Qwen3-0.6B-Q8_0"
             print(f"\n[Model] Defaulting to smallest: {chosen}")
 
     if MOCK_MODE:
