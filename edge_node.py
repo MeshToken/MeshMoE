@@ -29,6 +29,13 @@ MOCK_EXPERT = os.getenv("MOCK_EXPERT", "general")
 # 重型节点(H100/A100 集群)已有推理基建,接这个变量即入网。
 INFER_URL = os.getenv("MESHMOE_INFER_URL", "").rstrip("/")
 INFER_MODEL = os.getenv("MESHMOE_INFER_MODEL", "default")
+# 远端端点的 key(vLLM 通常空;LiteLLM/one-api 系需要)
+INFER_KEY = os.getenv("MESHMOE_INFER_KEY", "")
+# ⭐ 自定义模型名 + 档位(INFER_URL 模式不受 MODEL_CATALOG 限制):
+# MESHMOE_MODEL=DeepSeek-V3.2 MESHMOE_TIER=heavy 即可注册任意模型
+MESHMOE_TIER = os.getenv("MESHMOE_TIER", "")
+# ⭐ 账户绑定:注册带 api_key → 分成进自己账户(不填 = 匿名节点,分成无人认领)
+MESHMOE_API_KEY = os.getenv("MESHMOE_API_KEY", "")
 
 if MOCK_MODE:
     print("=" * 60)
@@ -300,8 +307,11 @@ class EdgeNode:
             "model": INFER_MODEL, "messages": messages,
             "max_tokens": max_tokens, "temperature": 0.7, "stream": stream,
         }).encode()
+        headers = {"Content-Type": "application/json"}
+        if INFER_KEY:
+            headers["Authorization"] = f"Bearer {INFER_KEY}"
         req = Request(f"{INFER_URL}/v1/chat/completions", data=body,
-                      headers={"Content-Type": "application/json"}, method="POST")
+                      headers=headers, method="POST")
         return urlopen(req, timeout=300)
 
     def infer_stream(self, messages, max_tokens=512):
@@ -487,6 +497,7 @@ def register_with_router(hardware_info, model_name, expert_type, tier):
         "tier": tier,
         "hardware": hardware_info,
         "mock": MOCK_MODE,
+        "api_key": MESHMOE_API_KEY,  # owner 绑定:分成到账(可空 = 匿名)
     }).encode()
 
     url = f"{ROUTER_URL}/api/nodes"  # Nginx proxies /api/nodes to Router
@@ -495,7 +506,10 @@ def register_with_router(hardware_info, model_name, expert_type, tier):
         try:
             req = Request(register_url, data=data, headers={
                 "Content-Type": "application/json",
-                "User-Agent": f"MeshMoE-Edge/2.0 ({NODE_ID})"
+                "User-Agent": f"MeshMoE-Edge/2.0 ({NODE_ID})",
+                # 官方节点:MESHMOE_INTERNAL_KEY → verified(免 L2 探针/L3 抽检);
+                # 第三方节点无 key → 必须过探针(防冒充设计)
+                "X-Internal-Key": os.getenv("MESHMOE_INTERNAL_KEY", ""),
             }, method="POST")
             with urlopen(req, timeout=10) as resp:
                 result = json.loads(resp.read())
@@ -579,10 +593,12 @@ def worker_loop():
     """主工作循环: 轮询任务 → 推理 → 回报"""
     global edge
 
-    # 注册
+    # 注册(tier:目录优先,INFER_URL 自定义模型用 MESHMOE_TIER)
     hw_info, _ = detect_hardware()
     cfg = MODEL_CATALOG.get(edge.model_name, {})
-    register_with_router(hw_info, edge.model_name, cfg.get("expert_type", "general"), cfg.get("tier", "light"))
+    node_tier = cfg.get("tier") or MESHMOE_TIER or "light"
+    node_expert = cfg.get("expert_type", "general")
+    register_with_router(hw_info, edge.model_name, node_expert, node_tier)
 
     # 定时重新注册 (每5分钟)
     last_register = time.time()
@@ -590,7 +606,7 @@ def worker_loop():
     while edge.running:
         # 重新注册
         if time.time() - last_register > 300:
-            register_with_router(hw_info, edge.model_name, cfg.get("expert_type", "general"), cfg.get("tier", "light"))
+            register_with_router(hw_info, edge.model_name, node_expert, node_tier)
             last_register = time.time()
 
         # 轮询任务
@@ -698,6 +714,17 @@ def main():
     if MOCK_MODE:
         cfg = {"tier": MOCK_TIER, "expert_type": MOCK_EXPERT, "description": "MOCK - no real model", "size_mb": 0}
         model_path = "/tmp/mock_model.gguf"
+    elif INFER_URL:
+        # 数据中心模式:任意模型名,档位用 MESHMOE_TIER(默认 heavy)
+        cfg = {
+            "tier": MESHMOE_TIER or "heavy",
+            "expert_type": "general",
+            "description": f"remote endpoint ({INFER_URL})",
+            "size_mb": 0,
+        }
+        model_path = None
+        if chosen not in MODEL_CATALOG:
+            print(f"[Model] Custom datacenter model: {chosen} (tier={cfg['tier']}, not in local catalog — OK for INFER_URL mode)")
     else:
         if chosen not in MODEL_CATALOG:
             print(f"[Model] Unknown model: {chosen}")
