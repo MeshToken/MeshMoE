@@ -9,6 +9,19 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 
+# 🔑 加载部署 .env(2026-07-20):MESHMOE_INTERNAL_KEY 用于 verified 注册。
+# 之前 edge 进程没读 .env → 注册发空 key → verified 恒 False(L2/L3 白名单失效实锤)。
+_env_file = os.getenv("MESHMOE_ENV_FILE", "/opt/meshmoe/.env")
+if os.path.exists(_env_file):
+    with open(_env_file) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith('#') and '=' in _line:
+                _k, _, _v = _line.partition('=')
+                _k, _v = _k.strip(), _v.strip()
+                if _k and _k not in os.environ:
+                    os.environ[_k] = _v
+
 # ============ 配置 ============
 ROUTER_URL = os.getenv("MESHMOE_ROUTER_URL", "http://127.0.0.1:4001")
 MODEL_DIR = os.getenv("MESHMOE_MODEL_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "models"))
